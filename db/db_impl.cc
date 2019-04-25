@@ -8,7 +8,6 @@
 #include <stdio.h>
 
 #include <algorithm>
-#include <atomic>
 #include <set>
 #include <string>
 #include <vector>
@@ -48,8 +47,7 @@ struct DBImpl::Writer {
   bool done;
   port::CondVar cv;
 
-  explicit Writer(port::Mutex* mu)
-      : batch(nullptr), sync(false), done(false), cv(mu) {}
+  explicit Writer(port::Mutex* mu) : cv(mu) { }
 };
 
 struct DBImpl::CompactionState {
@@ -79,10 +77,10 @@ struct DBImpl::CompactionState {
 
   explicit CompactionState(Compaction* c)
       : compaction(c),
-        smallest_snapshot(0),
         outfile(nullptr),
         builder(nullptr),
-        total_bytes(0) {}
+        total_bytes(0) {
+  }
 };
 
 // Fix user-supplied options to be reasonable
@@ -134,11 +132,10 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       dbname_(dbname),
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
       db_lock_(nullptr),
-      shutting_down_(false),
+      shutting_down_(nullptr),
       background_work_finished_signal_(&mutex_),
       mem_(nullptr),
       imm_(nullptr),
-      has_imm_(false),
       logfile_(nullptr),
       logfile_number_(0),
       log_(nullptr),
@@ -147,14 +144,16 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       background_compaction_scheduled_(false),
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
-                               &internal_comparator_)) {}
+                               &internal_comparator_)) {
+  has_imm_.Release_Store(nullptr);
+}
 
 DBImpl::~DBImpl() {
-  // Wait for background work to finish.
+  // Wait for background work to finish
   mutex_.Lock();
-  shutting_down_.store(true, std::memory_order_release);
-  while (background_compaction_scheduled_) {
-    background_work_finished_signal_.Wait();
+  shutting_down_.Release_Store(this);  // Any non-null value is ok 随便存个非空值即可，标记正在关闭
+  while (background_compaction_scheduled_) { // 循环是为了防止虚假唤醒误判
+    background_work_finished_signal_.Wait(); // 等待后台工作结束
   }
   mutex_.Unlock();
 
@@ -548,7 +547,7 @@ void DBImpl::CompactMemTable() {
   Status s = WriteLevel0Table(imm_, &edit, base);
   base->Unref();
 
-  if (s.ok() && shutting_down_.load(std::memory_order_acquire)) {
+  if (s.ok() && shutting_down_.Acquire_Load()) {
     s = Status::IOError("Deleting DB during memtable compaction");
   }
 
@@ -563,7 +562,7 @@ void DBImpl::CompactMemTable() {
     // Commit to the new state
     imm_->Unref();
     imm_ = nullptr;
-    has_imm_.store(false, std::memory_order_release);
+    has_imm_.Release_Store(nullptr);
     DeleteObsoleteFiles();
   } else {
     RecordBackgroundError(s);
@@ -611,8 +610,7 @@ void DBImpl::TEST_CompactRange(int level, const Slice* begin,
   }
 
   MutexLock l(&mutex_);
-  while (!manual.done && !shutting_down_.load(std::memory_order_acquire) &&
-         bg_error_.ok()) {
+  while (!manual.done && !shutting_down_.Acquire_Load() && bg_error_.ok()) {
     if (manual_compaction_ == nullptr) {  // Idle
       manual_compaction_ = &manual;
       MaybeScheduleCompaction();
@@ -654,7 +652,7 @@ void DBImpl::MaybeScheduleCompaction() {
   mutex_.AssertHeld();
   if (background_compaction_scheduled_) {
     // Already scheduled
-  } else if (shutting_down_.load(std::memory_order_acquire)) {
+  } else if (shutting_down_.Acquire_Load()) {
     // DB is being deleted; no more background compactions
   } else if (!bg_error_.ok()) {
     // Already got an error; no more changes
@@ -675,7 +673,7 @@ void DBImpl::BGWork(void* db) {
 void DBImpl::BackgroundCall() {
   MutexLock l(&mutex_);
   assert(background_compaction_scheduled_);
-  if (shutting_down_.load(std::memory_order_acquire)) {
+  if (shutting_down_.Acquire_Load()) {
     // No more background work when shutting down.
   } else if (!bg_error_.ok()) {
     // No more background work after a background error.
@@ -754,7 +752,7 @@ void DBImpl::BackgroundCompaction() {
 
   if (status.ok()) {
     // Done
-  } else if (shutting_down_.load(std::memory_order_acquire)) {
+  } else if (shutting_down_.Acquire_Load()) {
     // Ignore compaction errors found during shutting down
   } else {
     Log(options_.info_log,
@@ -921,9 +919,9 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   std::string current_user_key;
   bool has_current_user_key = false;
   SequenceNumber last_sequence_for_key = kMaxSequenceNumber;
-  for (; input->Valid() && !shutting_down_.load(std::memory_order_acquire); ) {
+  for (; input->Valid() && !shutting_down_.Acquire_Load(); ) {
     // Prioritize immutable compaction work
-    if (has_imm_.load(std::memory_order_relaxed)) {
+    if (has_imm_.NoBarrier_Load() != nullptr) {
       const uint64_t imm_start = env_->NowMicros();
       mutex_.Lock();
       if (imm_ != nullptr) {
@@ -1016,7 +1014,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     input->Next();
   }
 
-  if (status.ok() && shutting_down_.load(std::memory_order_acquire)) {
+  if (status.ok() && shutting_down_.Acquire_Load()) {
     status = Status::IOError("Deleting DB during compaction");
   }
   if (status.ok() && compact->builder != nullptr) {
@@ -1194,6 +1192,7 @@ void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
 }
 
 // Convenience methods
+// 直接调用了基类的 Put 方法
 Status DBImpl::Put(const WriteOptions& o, const Slice& key, const Slice& val) {
   return DB::Put(o, key, val);
 }
@@ -1209,13 +1208,15 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* my_batch) {
   w.done = false;
 
   MutexLock l(&mutex_);
-  writers_.push_back(&w);
-  while (!w.done && &w != writers_.front()) {
+  writers_.push_back(&w); // 注意，指针是内置类型，当做为右值类型时支持 move 语义，所以这里调用的就是 deque 的右值引用版本的 push_back
+  while (!w.done && &w != writers_.front()) { // 当前 writer 工作没完成并且当前队列首元素不是该 writer
     w.cv.Wait();
   }
-  if (w.done) {
+  if (w.done) { // 当前 writer 工作已经完成了
     return w.status;
   }
+
+  // 到这只有一个原因，那就是 w 没有完成工作，且 w 是 writer 队列的首元素
 
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(my_batch == nullptr);
@@ -1327,9 +1328,13 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
 
 // REQUIRES: mutex_ is held
 // REQUIRES: this thread is currently at the front of the writer queue
+//
+// 调用该方法前提：
+// - mutex_ 被当前线程持有
+// - 当前线程当前在 writer 队列的队首
 Status DBImpl::MakeRoomForWrite(bool force) {
-  mutex_.AssertHeld();
-  assert(!writers_.empty());
+  mutex_.AssertHeld(); // 断言当前线程持有 mutex_
+  assert(!writers_.empty()); // 断言 writer 队列不为空
   bool allow_delay = !force;
   Status s;
   while (true) {
@@ -1380,7 +1385,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       logfile_number_ = new_log_number;
       log_ = new log::Writer(lfile);
       imm_ = mem_;
-      has_imm_.store(true, std::memory_order_release);
+      has_imm_.Release_Store(imm_);
       mem_ = new MemTable(internal_comparator_);
       mem_->Ref();
       force = false;   // Do not force another compaction if have room
@@ -1485,6 +1490,8 @@ void DBImpl::GetApproximateSizes(
 
 // Default implementations of convenience methods that subclasses of DB
 // can call if they wish
+//
+// DB 的默认 Put 实现，派生类可以直接使用。
 Status DB::Put(const WriteOptions& opt, const Slice& key, const Slice& value) {
   WriteBatch batch;
   batch.Put(key, value);
